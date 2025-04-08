@@ -18,7 +18,7 @@ Yilun Du, Joshua B. Tenenbaum, Chuang Gan
   </p>
 </p>
 
-*News* Mar 20: HAZAR challenge will be one of the challenges in CVPR Embodied AI Workshop 2025. The [leaderboard submission](documentation/get_started/submit.md#submit-to-the-leaderboard) is open now, welcome 2025 submissions!
+*News* Mar 20: HAZAR challenge will be one of the challenges in CVPR Embodied AI Workshop 2025. The [leaderboard submission](documentation/get_started/submit.md#submit-to-the-leaderboard) is open now, welcome 2025 submissions! (will end in 1 June)
 
 ## Detailed documentations
 
