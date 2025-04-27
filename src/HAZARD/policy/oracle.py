@@ -8,8 +8,8 @@ from envs.flood.utils import ObjectState as FloodObjectState
 from envs.fire.fire_utils import ObjectState as FireObjectState
 from tdw.add_ons.occupancy_map import OccupancyMap
 
+# locate HAZARD root
 PATH = os.path.dirname(os.path.abspath(__file__))
-# go to parent directory until the folder name is HAZARD
 while os.path.basename(PATH) != "HAZARD":
     PATH = os.path.dirname(PATH)
 sys.path.append(PATH)
@@ -30,6 +30,9 @@ class OracleAgent:
         self.agent_position = []
         self.step_limit = 0
         self.frame_bias = 0
+        # pruning parameters
+        self.global_best_value = 0
+        self.max_unit_value = 5
 
     def reset(self, goal_objects, objects_info, controller, step_limit):
         self.goal_objects = goal_objects
@@ -40,8 +43,10 @@ class OracleAgent:
         self.target_damaged_status_sequence = []
         self.target_position_sequence = []
         self.map_list = []
-        self.step_limit = 0
+        self.step_limit = step_limit
         self.frame_bias = 0
+        # reset pruning
+        self.global_best_value = 0
 
     def find_path(self, agent_pos, target, start_step):
         meet = False
@@ -58,41 +63,57 @@ class OracleAgent:
                 target_position = self.target_position_sequence[cur_step][target_id]
             except Exception:
                 pdb.set_trace()
-            distance = (agent_pos[0] - target_position[0]) ** 2 + (agent_pos[2] - target_position[2]) ** 2
-            distance = math.sqrt(distance)
+            dx = agent_pos[0] - target_position[0]
+            dz = agent_pos[2] - target_position[2]
+            distance = math.sqrt(dx*dx + dz*dz)
             if additional_steps * self.agent_speed >= distance:
                 meet = True
-                agent_pos = self.target_position_sequence[cur_step][target_id]
-                value_dict = json.load(open("data/meta_data/value.json"))
+                agent_pos = target_position
+                val_dict = json.load(open("data/meta_data/value.json"))
                 name = self.controller.target_id2name[target]
-                if name in value_dict:
-                    if value_dict[name] == 1:
-                        value = 5
-                    else:
-                        value = 1
+                if name in val_dict and val_dict[name] == 1:
+                    value = 5
                 else:
                     value = 1
                 if self.target_damaged_status_sequence[cur_step][target_id]:
                     value /= 2
-
         return agent_pos, additional_steps, value
 
     def search_step(self, search_order, agent_pos, step, value):
+        # base: all done or reached limit
         if len(search_order) == len(self.controller.target_ids) or step >= self.step_limit:
             return step, search_order, value
-        min_step = 1e5
+        # pruning by optimistic bound
+        remaining = len(self.controller.target_ids) - len(search_order)
+        if value + remaining * self.max_unit_value <= self.global_best_value:
+            return step, search_order, value
+        min_step = float('inf')
         max_value = -1
         best_order = None
+        # explore next target
         for idx in self.controller.target_ids:
-            if idx not in search_order:
-                new_agent_pos, new_step, new_value = self.find_path(agent_pos, idx, step)
-                sub_min_step, sub_best_order, sub_best_value = self.search_step(search_order + [idx],
-                                                                                new_agent_pos, step + new_step,
-                                                                                value + new_value)
-                if sub_best_value > max_value or (sub_best_value == max_value and sub_min_step < min_step):
-                    max_value = value
-                    best_order = sub_best_order
-                    min_step = sub_min_step
+            if idx in search_order:
+                continue
+            new_pos, d_step, d_value = self.find_path(agent_pos, idx, step)
+            # if stepping beyond limit: record partial solution
+            if step + d_step > self.step_limit:
+                sub_order = search_order + [idx]
+                sub_value = value + d_value
+                sub_step = self.step_limit
+            else:
+                sub_step, sub_order, sub_value = self.search_step(
+                    search_order + [idx], new_pos, step + d_step, value + d_value)
+            # update global best
+            if sub_value > self.global_best_value:
+                self.global_best_value = sub_value
+            # select best
+            if sub_value > max_value or (sub_value == max_value and sub_step < min_step):
+                max_value = sub_value
+                min_step = sub_step
+                best_order = sub_order
+        # return best found
+        if best_order is None:
+            return step, search_order, value
         return min_step, best_order, max_value
 
     def search_plan(self):
@@ -100,8 +121,11 @@ class OracleAgent:
         if len(self.controller.target_ids) > 11:
             return []
         self.frame_bias = self.step_limit - len(self.target_position_sequence)
+        self.global_best_value = 0
         min_step, best_order, best_value = self.search_step([], self.agent_position, 0, 0)
         print("End search", min_step, best_order, best_value)
+        if not best_order:
+            return [("walk_to", idx) for idx in search_order]  # fallback to partial
         return [("walk_to", idx) for idx in best_order]
 
     def save_info(self):
@@ -109,24 +133,21 @@ class OracleAgent:
             self.agent_position = self.controller.agents[0].dynamic.transform.position
             self.first_save = False
         position = {}
-        damaged_status = []
+        damaged = []
         for idx in self.controller.target_ids:
-            obj_status = self.controller.manager.objects[idx]
-            position[idx] = obj_status.position
+            obj = self.controller.manager.objects[idx]
+            position[idx] = obj.position
             if self.task == "fire":
-                damaged_status.append(obj_status.state == FloodObjectState.FLOODED or
-                                      obj_status.state == FloodObjectState.FLOODED_FLOATING)
+                damaged.append(obj.state in (FloodObjectState.FLOODED, FloodObjectState.FLOODED_FLOATING))
             elif self.task == "flood":
-                damaged_status.append(obj_status.state == FireObjectState.BURNING or
-                                      obj_status.state == FireObjectState.BURNT)
+                damaged.append(obj.state in (FireObjectState.BURNING, FireObjectState.BURNT))
             else:
-                damaged_status.append(False)
-        self.target_damaged_status_sequence.append(damaged_status)
+                damaged.append(False)
+        self.target_damaged_status_sequence.append(damaged)
         self.target_position_sequence.append(position)
 
     def choose_target(self, state, processed_input):
         return "explore", None
-
 
 if __name__ == "__main__":
     agent = OracleAgent("fire")
